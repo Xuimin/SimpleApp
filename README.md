@@ -23,6 +23,19 @@ The brief asked for full product CRUD with categories, soft + bulk delete, Excel
 
 ---
 
+## Assumptions and design choices
+
+### Headline assumptions
+
+- **Single admin role.** The brief implies one type of authenticated user (the admin); there is no per-user ownership, no roles beyond `is_admin`, and no public/customer-facing surface. Authorization collapses to "are you logged in *and* an admin?".
+- **Soft delete is the default for destroy.** Both the dashboard and the API soft-delete on `DELETE`; recovery is exposed via the "Trashed" status filter. Nothing currently issues a hard delete.
+- **MySQL in dev, SQLite in tests.** The two are kept compatible by avoiding MySQL-specific SQL; in exchange, tests stay hermetic and run in ~5 s without a running database server.
+- **No frontend build.** Bootstrap is loaded from a CDN and the only JS is two short inline snippets. Adding Vite/Vue/Livewire would be over-engineering for the scope.
+- **Excel export streams from the database.** Implemented via `FromQuery`, so memory stays flat regardless of catalogue size — `Excel::queue()` is a one-line upgrade if it ever needs backgrounding.
+- **API and Admin share the domain layer.** Form Requests, the Eloquent model, and `AdminMiddleware` are reused; only the response format (Blade vs JSON resource) differs between surfaces.
+
+---
+
 ## Architectural approach
 
 ### 1. Two route files, one domain layer
@@ -114,20 +127,48 @@ Two of the more interesting tests exist because of bugs that actually slipped th
 
 ---
 
-## Quick start
+## Project setup instructions
+
+### Prerequisites
+
+| Tool | Version | Notes |
+| --- | --- | --- |
+| PHP | **8.4+** | Laravel 13 hard-requires it. XAMPP ships with `php-8.4` here; the old 8.2 binary is preserved at `xampp/php-8.2-backup/`. |
+| Composer | 2.x | `composer --version` |
+| MySQL | 8 (via XAMPP) | Or any MariaDB 10.6+. The test suite uses an in-memory SQLite, so MySQL is only needed for dev. |
+| Node | not required | No frontend build step — Bootstrap is loaded from a CDN. |
+
+### Step-by-step
 
 ```bash
-# 1. Database (XAMPP MySQL must be running)
+# 1. Clone and enter the project
+git clone <repo-url> laravel-crud
+cd laravel-crud
+
+# 2. Create the database (XAMPP MySQL must be running)
 mysql -u root -e "CREATE DATABASE laravel_crud CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 
-# 2. App
-cp .env.example .env       # set DB_CONNECTION=mysql, DB_DATABASE=laravel_crud, DB_USERNAME=root
+# 3. Install PHP dependencies
 composer install
+
+# 4. Configure environment
+cp .env.example .env
+#    Edit .env — at minimum:
+#      DB_CONNECTION=mysql
+#      DB_DATABASE=laravel_crud
+#      DB_USERNAME=root
+#      DB_PASSWORD=
+
+# 5. Generate the app key
 php artisan key:generate
+
+# 6. Run migrations and seed the admin user + categories
 php artisan migrate:fresh --seed
+
+# 7. Generate the Swagger spec (optional — only needed for /api/documentation)
 php artisan l5-swagger:generate
 
-# 3. Run
+# 8. Start the dev server
 php artisan serve          # http://127.0.0.1:8000
 ```
 
@@ -137,7 +178,15 @@ The seeder creates:
 - **Three categories** — `Item`, `Food`, `Equipment`
 - No products. Add some via the dashboard or the API.
 
-URLs to explore:
+### Running the tests
+
+```bash
+php artisan test                # 25 passed (72 assertions)
+```
+
+The suite runs against an **in-memory SQLite database** (configured in `phpunit.xml`) — no MySQL needed for CI. `RefreshDatabase` resets schema between tests, and Sanctum's `Sanctum::actingAs($user, ['*'])` bypasses the token round-trip for API tests.
+
+### Quick smoke test
 
 | What | URL / verb |
 | --- | --- |
@@ -145,11 +194,134 @@ URLs to explore:
 | Admin dashboard (5 / page) | `GET /admin/products` |
 | Admin filter | `GET /admin/products?status=enabled&category_id=2` |
 | Excel export | `GET /admin/products/export` |
-| Swagger UI | `GET /api/documentation` (page renders; spec is empty until annotations are re-added) |
-| Issue API token | `POST /api/login` with JSON `{ "email":"…", "password":"…" }` |
-| List products | `GET /api/products?category_id=1&status=enabled&per_page=20` (with `Authorization: Bearer …`) |
-| Create / update / delete | `POST` / `PUT` / `DELETE /api/products[/{id}]` |
-| Bulk delete | `DELETE /api/products/bulk` body `{ "ids": [1,2,3] }` |
+| Swagger UI | `GET /api/documentation` |
+
+---
+
+## API endpoints documentation
+
+All API routes are prefixed with `/api`. Every endpoint except `POST /api/login` requires a Sanctum bearer token **and** an admin user (`is_admin = true`); requests from non-admins return `403`.
+
+**Auth header** — `Authorization: Bearer <token>` (token issued by `POST /api/login`)
+**Content type** — `Content-Type: application/json` and `Accept: application/json`
+
+### Authentication
+
+#### `POST /api/login` — issue a token *(public)*
+
+Request body:
+
+```json
+{ "email": "admin@example.com", "password": "password" }
+```
+
+Response `200`:
+
+```json
+{
+  "token": "1|abcDEF...",
+  "token_type": "Bearer",
+  "user": { "id": 1, "name": "Admin", "email": "admin@example.com", "is_admin": true }
+}
+```
+
+Failure: `422` with `{"message":"...","errors":{"email":["These credentials do not match our records."]}}`.
+
+#### `POST /api/logout` — revoke the current token
+
+Returns `204 No Content`. The token used to make the request is deleted; subsequent requests with it return `401`.
+
+#### `GET /api/user` — current authenticated user
+
+Returns the raw `User` model JSON for the bearer token holder.
+
+### Products
+
+#### `GET /api/products` — list (paginated)
+
+Query parameters:
+
+| Param | Type | Notes |
+| --- | --- | --- |
+| `category_id` | int | Filter by category. Falsy values are ignored. |
+| `status` | `enabled` \| `disabled` \| `trashed` | Filters by `enabled` flag, or returns soft-deleted rows for `trashed`. |
+| `per_page` | int | Page size; default `15`. |
+| `page` | int | Standard Laravel pagination. |
+
+Response `200` — paginated `ProductResource` collection (`data`, `links`, `meta`):
+
+```json
+{
+  "data": [
+    {
+      "id": 1,
+      "name": "Acme Widget",
+      "description": "...",
+      "price": "19.99",
+      "stock": 42,
+      "enabled": true,
+      "category": { "id": 3, "name": "Tools" },
+      "created_at": "2026-04-30T11:04:09.000000Z",
+      "updated_at": "2026-04-30T11:04:09.000000Z",
+      "deleted_at": null
+    }
+  ],
+  "links": { "first": "...", "last": "...", "prev": null, "next": "..." },
+  "meta": { "current_page": 1, "per_page": 15, "total": 1, "..." : "..." }
+}
+```
+
+#### `POST /api/products` — create
+
+Request body:
+
+| Field | Rules |
+| --- | --- |
+| `name` | required, string, max 255 |
+| `description` | nullable, string |
+| `price` | required, numeric, ≥ 0 |
+| `stock` | required, integer, ≥ 0 |
+| `enabled` | boolean (coerced from `0/1/"0"/"1"/true/false`) |
+| `category_id` | required, must `exists:categories,id` |
+
+Response `201` — single `ProductResource`. Validation failures return `422` with the standard Laravel error envelope.
+
+#### `GET /api/products/{id}` — show
+
+Returns `200` with a single `ProductResource`. Soft-deleted products return `404`.
+
+#### `PUT /api/products/{id}` — update
+
+Same fields as create, but every rule is `sometimes` so partial updates work. Returns `200` with the updated `ProductResource`.
+
+#### `DELETE /api/products/{id}` — soft delete
+
+Returns `204 No Content`. The row stays in the table with `deleted_at` set; it disappears from the default listing and reappears under `?status=trashed`.
+
+#### `DELETE /api/products/bulk` — bulk soft delete
+
+Request body:
+
+```json
+{ "ids": [1, 2, 3] }
+```
+
+Rules: `ids` is required, a non-empty array; each id must `exists:products,id`.
+
+Response `200`:
+
+```json
+{ "deleted": 3 }
+```
+
+### Standard error responses
+
+| Status | When |
+| --- | --- |
+| `401 Unauthenticated` | Missing or invalid bearer token. |
+| `403 Forbidden` | Authenticated but `is_admin = false`. JSON body: `{"message":"Forbidden"}`. |
+| `404 Not Found` | Unknown product id, or attempting to `show` a soft-deleted row. |
+| `422 Unprocessable Entity` | Validation failure. Body: `{"message":"...","errors":{ "<field>": ["..."] }}`. |
 
 ---
 
@@ -192,16 +364,6 @@ database/
 
 ---
 
-## Running the tests
-
-```bash
-php artisan test                # 25 passed (72 assertions)
-```
-
-The whole suite runs against an **in-memory SQLite database** (configured in `phpunit.xml`) — no MySQL needed for CI. `RefreshDatabase` resets schema between tests, and Sanctum's `Sanctum::actingAs($user, ['*'])` is used on the API tests to bypass the token round-trip.
-
----
-
 ## Things deliberately out of scope
 
 - **No password reset / registration flow.** The brief only requires authenticated admin access; the seeder ships an admin and that's enough for the demo.
@@ -211,15 +373,3 @@ The whole suite runs against an **in-memory SQLite database** (configured in `ph
 - **Apache integration.** XAMPP's bundled Apache loaded the old PHP 8.2's `php8ts.dll`. `php artisan serve` (port 8000) bypasses Apache entirely, so the project runs fine — but pointing Apache at the new PHP would need a separate `httpd-xampp.conf` tweak.
 
 ---
-
-## Decisions worth highlighting in an interview
-
-1. **Two route files, one domain layer.** Same business logic shared via Form Requests, model scopes, and `ProductResource`; the controllers themselves stay thin.
-2. **Soft deletes everywhere.** Both `Category` and `Product` are recoverable; the admin "Trashed" status filter exposes them.
-3. **`AdminMiddleware` is content-aware** — JSON 403 vs HTML `abort(403)` — so the same alias works on both route files.
-4. **`WithStrictNullComparison` for Excel.** Caught a real bug (zero-stock cells rendering blank) and locked it in with a regression test that actually parses the generated `.xlsx`.
-5. **Per-row delete forms are *not* nested inside the bulk-delete form.** Browsers silently drop nested `<form>` open tags, which broke individual deletes; the bulk form lives outside the table now and row checkboxes attach to it via the HTML5 `form="bulk-form"` attribute. Regression test asserts the `</form>` of the bulk form appears *before* the row delete form opens.
-6. **Tests cover the actual regressions, not just the happy path.** Both fixes above ship with a test that would have caught them on the way in.
-
----
-
